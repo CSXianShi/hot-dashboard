@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""樾的 F1 + 歌星热点仪表盘生成器。
+
+抓取 RSS/API -> 计算热度 -> 生成静态 index.html。
+纯标准库,无依赖;适合在 1GB 小服务器上跑。
+"""
+import json
+import re
+import html
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+UA = {"User-Agent": "Mozilla/5.0 (Linux; dashboard-bot)"}
+CST = timezone(timedelta(hours=8))
+
+F1_FEEDS = [
+    ("Autosport", "https://www.autosport.com/rss/f1/news/"),
+    ("Motorsport", "https://www.motorsport.com/rss/f1/news/"),
+    ("F1.com", "https://www.formula1.com/en/latest/all.xml"),
+]
+
+ARTISTS = [
+    "Olivia Rodrigo",
+    "Ariana Grande",
+    "Charli XCX",
+    "Tate McRae",
+    "Billie Eilish",
+    "RAYE",
+]
+
+GNEWS = 'https://news.google.com/rss/search?q="{q}"&hl=en-US&gl=US&ceid=US:en'
+
+
+def fetch(url, timeout=20):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def parse_rss(raw):
+    """Return list of {title, link, ts} from an RSS byte string."""
+    items = []
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return items
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        pub = it.findtext("pubDate") or ""
+        try:
+            ts = parsedate_to_datetime(pub)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            ts = None
+        if title:
+            items.append({"title": title, "link": link, "ts": ts})
+    return items
+
+
+def hours_ago(ts, now):
+    if ts is None:
+        return 999
+    return (now - ts).total_seconds() / 3600
+
+
+def collect_f1(now):
+    news, seen = [], set()
+    for src, url in F1_FEEDS:
+        try:
+            for it in parse_rss(fetch(url)):
+                key = re.sub(r"\W+", "", it["title"].lower())[:60]
+                if key in seen:
+                    continue
+                seen.add(key)
+                it["src"] = src
+                it["age"] = hours_ago(it["ts"], now)
+                news.append(it)
+        except Exception as e:
+            print(f"[warn] F1 feed {src}: {e}")
+    news.sort(key=lambda x: x["age"])
+    return [n for n in news if n["age"] < 72][:8]
+
+
+def collect_standings():
+    out = {"drivers": [], "constructors": [], "next_race": None}
+    try:
+        d = json.loads(fetch("https://api.jolpi.ca/ergast/f1/current/driverstandings.json"))
+        for r in d["MRData"]["StandingsTable"]["StandingsLists"][0]["DriverStandings"][:8]:
+            out["drivers"].append({
+                "pos": r["position"],
+                "name": r["Driver"]["givenName"] + " " + r["Driver"]["familyName"],
+                "team": r["Constructors"][0]["name"] if r["Constructors"] else "",
+                "pts": r["points"],
+            })
+    except Exception as e:
+        print(f"[warn] driver standings: {e}")
+    try:
+        d = json.loads(fetch("https://api.jolpi.ca/ergast/f1/current/constructorstandings.json"))
+        for r in d["MRData"]["StandingsTable"]["StandingsLists"][0]["ConstructorStandings"][:5]:
+            out["constructors"].append({"pos": r["position"], "name": r["Constructor"]["name"], "pts": r["points"]})
+    except Exception as e:
+        print(f"[warn] constructor standings: {e}")
+    try:
+        d = json.loads(fetch("https://api.jolpi.ca/ergast/f1/current/races.json"))
+        today = datetime.now(timezone.utc).date()
+        for r in d["MRData"]["RaceTable"]["Races"]:
+            rd = datetime.strptime(r["date"], "%Y-%m-%d").date()
+            if rd >= today:
+                t = r.get("time", "12:00:00Z").replace("Z", "+00:00")
+                dt = datetime.fromisoformat(r["date"] + "T" + t).astimezone(CST)
+                out["next_race"] = {
+                    "name": r["raceName"],
+                    "circuit": r["Circuit"]["circuitName"],
+                    "cst": dt.strftime("%m月%d日 %H:%M"),
+                    "days": (rd - today).days,
+                }
+                break
+    except Exception as e:
+        print(f"[warn] race schedule: {e}")
+    return out
+
+
+def collect_artists(now):
+    rows = []
+    for name in ARTISTS:
+        entry = {"name": name, "n24": 0, "n48": 0, "score": 0, "top": []}
+        try:
+            items = parse_rss(fetch(GNEWS.format(q=urllib.request.quote(name))))
+            for it in items:
+                age = hours_ago(it["ts"], now)
+                if age < 24:
+                    entry["n24"] += 1
+                if age < 48:
+                    entry["n48"] += 1
+            entry["score"] = entry["n24"] * 2 + entry["n48"]
+            fresh = sorted(items, key=lambda x: hours_ago(x["ts"], now))
+            entry["top"] = [{"title": i["title"], "link": i["link"]} for i in fresh[:3]]
+        except Exception as e:
+            print(f"[warn] artist {name}: {e}")
+        rows.append(entry)
+    rows.sort(key=lambda x: -x["score"])
+    return rows
+
+
+def esc(s):
+    return html.escape(s, quote=True)
+
+
+def render(f1_news, standings, artists, now):
+    updated = now.astimezone(CST).strftime("%Y-%m-%d %H:%M")
+    nr = standings["next_race"]
+    next_html = ""
+    if nr:
+        next_html = (
+            f'<div class="nextrace">🏁 下一站:<b>{esc(nr["name"])}</b>'
+            f'<span class="dim">{esc(nr["circuit"])}</span>'
+            f'<div>正赛 北京时间 {esc(nr["cst"])} · 还有 <b>{nr["days"]}</b> 天</div></div>'
+        )
+
+    drows = "".join(
+        f'<tr><td>{d["pos"]}</td><td>{esc(d["name"])}</td>'
+        f'<td class="dim">{esc(d["team"])}</td><td class="pts">{d["pts"]}</td></tr>'
+        for d in standings["drivers"]
+    )
+    crows = "".join(
+        f'<tr><td>{c["pos"]}</td><td>{esc(c["name"])}</td><td class="pts">{c["pts"]}</td></tr>'
+        for c in standings["constructors"]
+    )
+    nrows = "".join(
+        f'<li><a href="{esc(n["link"])}" target="_blank">{esc(n["title"])}</a>'
+        f'<span class="dim"> · {esc(n["src"])} · {int(n["age"])}h前</span></li>'
+        for n in f1_news
+    )
+
+    max_score = max((a["score"] for a in artists), default=0) or 1
+    acards = ""
+    for a in artists:
+        bar = int(a["score"] / max_score * 100)
+        fire = "🔥" * min(3, 1 + a["score"] // (max_score // 2 + 1)) if a["score"] else "💤"
+        links = "".join(
+            f'<li><a href="{esc(t["link"])}" target="_blank">{esc(t["title"])}</a></li>'
+            for t in a["top"]
+        )
+        acards += f"""<div class="card artist">
+<div class="ahead"><b>{esc(a["name"])}</b><span>{fire} 热度 {a["score"]}</span></div>
+<div class="bar"><i style="width:{bar}%"></i></div>
+<div class="dim small">24h 内 {a["n24"]} 条报道 · 48h 内 {a["n48"]} 条</div>
+<ul class="small">{links}</ul></div>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>樾的热点仪表盘</title>
+<style>
+:root {{ color-scheme: dark; }}
+* {{ box-sizing: border-box; margin: 0; }}
+body {{ font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #0d1117; color: #e6edf3; padding: 16px; max-width: 760px; margin: auto; }}
+h1 {{ font-size: 1.3em; margin-bottom: 2px; }}
+h2 {{ font-size: 1.05em; margin: 18px 0 8px; color: #79c0ff; }}
+.dim {{ color: #8b949e; }} .small {{ font-size: .85em; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+  padding: 12px 14px; margin-bottom: 10px; }}
+.nextrace {{ background: linear-gradient(90deg,#2d1a1a,#161b22); border: 1px solid #6e2c2c;
+  border-radius: 10px; padding: 12px 14px; margin: 10px 0; }}
+.nextrace .dim {{ margin-left: 8px; font-size: .85em; }}
+table {{ width: 100%; border-collapse: collapse; font-size: .9em; }}
+td {{ padding: 4px 6px; border-bottom: 1px solid #21262d; }}
+.pts {{ text-align: right; font-weight: 600; color: #ffa657; }}
+ul {{ padding-left: 18px; }} li {{ margin: 5px 0; }}
+a {{ color: #a5d6ff; text-decoration: none; }} a:active {{ opacity: .7; }}
+.ahead {{ display: flex; justify-content: space-between; align-items: center; }}
+.ahead span {{ font-size: .85em; color: #ffa657; }}
+.bar {{ height: 6px; background: #21262d; border-radius: 3px; margin: 8px 0 4px; }}
+.bar i {{ display: block; height: 100%; border-radius: 3px;
+  background: linear-gradient(90deg,#f778ba,#ffa657); }}
+footer {{ margin: 20px 0 8px; text-align: center; font-size: .75em; color: #484f58; }}
+</style></head><body>
+<h1>🛸 樾的热点仪表盘</h1>
+<div class="dim small">更新于 {updated}(北京时间)· by Lando</div>
+<h2>🏎️ F1</h2>
+{next_html}
+<div class="card"><b class="small">车手积分榜</b><table>{drows}</table></div>
+<div class="card"><b class="small">车队积分榜</b><table>{crows}</table></div>
+<div class="card"><b class="small">最新消息</b><ul class="small">{nrows}</ul></div>
+<h2>🎵 歌星热度榜</h2>
+{acards}
+<footer>数据源:Autosport / Motorsport / F1.com / jolpica-f1 / Google News</footer>
+</body></html>"""
+
+
+def main():
+    now = datetime.now(timezone.utc)
+    f1_news = collect_f1(now)
+    standings = collect_standings()
+    artists = collect_artists(now)
+    out = BASE / "index.html"
+    out.write_text(render(f1_news, standings, artists, now), encoding="utf-8")
+    print(f"OK -> {out} ({out.stat().st_size} bytes)")
+
+
+if __name__ == "__main__":
+    main()
