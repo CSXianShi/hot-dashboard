@@ -7,6 +7,7 @@
 import json
 import re
 import html
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -14,8 +15,10 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
+HISTORY = BASE / "history.json"
 UA = {"User-Agent": "Mozilla/5.0 (Linux; dashboard-bot)"}
 CST = timezone(timedelta(hours=8))
+WEEKDAY = "一二三四五六日"
 
 F1_FEEDS = [
     ("Autosport", "https://www.autosport.com/rss/f1/news/"),
@@ -34,11 +37,28 @@ ARTISTS = [
 
 GNEWS = 'https://news.google.com/rss/search?q="{q}"&hl=en-US&gl=US&ceid=US:en'
 
+SESSION_NAMES = [
+    ("FirstPractice", "一练 FP1"),
+    ("SecondPractice", "二练 FP2"),
+    ("ThirdPractice", "三练 FP3"),
+    ("SprintQualifying", "冲刺排位"),
+    ("Sprint", "冲刺赛"),
+    ("Qualifying", "排位赛"),
+]
 
-def fetch(url, timeout=20):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+
+def fetch(url, timeout=20, retries=2):
+    last = None
+    for i in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+            if i < retries:
+                time.sleep(2 * (i + 1))
+    raise last
 
 
 def parse_rss(raw):
@@ -69,6 +89,11 @@ def hours_ago(ts, now):
     return (now - ts).total_seconds() / 3600
 
 
+def cst_str(date, t):
+    dt = datetime.fromisoformat(date + "T" + (t or "12:00:00Z").replace("Z", "+00:00")).astimezone(CST)
+    return dt, f"{dt.month}月{dt.day}日(周{WEEKDAY[dt.weekday()]}) {dt:%H:%M}"
+
+
 def collect_f1(now):
     news, seen = [], set()
     for src, url in F1_FEEDS:
@@ -87,7 +112,7 @@ def collect_f1(now):
     return [n for n in news if n["age"] < 72][:8]
 
 
-def collect_standings():
+def collect_standings(now):
     out = {"drivers": [], "constructors": [], "next_race": None}
     try:
         d = json.loads(fetch("https://api.jolpi.ca/ergast/f1/current/driverstandings.json"))
@@ -108,17 +133,24 @@ def collect_standings():
         print(f"[warn] constructor standings: {e}")
     try:
         d = json.loads(fetch("https://api.jolpi.ca/ergast/f1/current/races.json"))
-        today = datetime.now(timezone.utc).date()
+        today = now.date()
         for r in d["MRData"]["RaceTable"]["Races"]:
             rd = datetime.strptime(r["date"], "%Y-%m-%d").date()
             if rd >= today:
-                t = r.get("time", "12:00:00Z").replace("Z", "+00:00")
-                dt = datetime.fromisoformat(r["date"] + "T" + t).astimezone(CST)
+                race_dt, race_s = cst_str(r["date"], r.get("time"))
+                sessions = []
+                for key, label in SESSION_NAMES:
+                    s = r.get(key)
+                    if s:
+                        dt, txt = cst_str(s["date"], s.get("time"))
+                        sessions.append({"label": label, "txt": txt, "past": dt < now})
+                sessions.append({"label": "正赛 🏁", "txt": race_s, "past": race_dt < now})
                 out["next_race"] = {
                     "name": r["raceName"],
                     "circuit": r["Circuit"]["circuitName"],
-                    "cst": dt.strftime("%m月%d日 %H:%M"),
+                    "round": r["round"],
                     "days": (rd - today).days,
+                    "sessions": sessions,
                 }
                 break
     except Exception as e:
@@ -148,19 +180,51 @@ def collect_artists(now):
     return rows
 
 
+def load_history():
+    try:
+        return json.loads(HISTORY.read_text())
+    except Exception:
+        return []
+
+
+def update_history(artists, now):
+    """Append this run's scores; return {name: prev_score} from the previous run."""
+    hist = load_history()
+    prev = hist[-1]["scores"] if hist else {}
+    hist.append({"ts": now.isoformat(timespec="minutes"), "scores": {a["name"]: a["score"] for a in artists}})
+    HISTORY.write_text(json.dumps(hist[-60:], ensure_ascii=False, indent=1))
+    return prev
+
+
+def trend_mark(score, prev_score):
+    if prev_score is None:
+        return ""
+    if score > prev_score:
+        return f'<b class="up">↑{score - prev_score}</b>'
+    if score < prev_score:
+        return f'<b class="down">↓{prev_score - score}</b>'
+    return '<b class="flat">→</b>'
+
+
 def esc(s):
     return html.escape(s, quote=True)
 
 
-def render(f1_news, standings, artists, now):
+def render(f1_news, standings, artists, prev_scores, now):
     updated = now.astimezone(CST).strftime("%Y-%m-%d %H:%M")
     nr = standings["next_race"]
     next_html = ""
     if nr:
+        srows = "".join(
+            f'<tr class="{"past" if s["past"] else ""}"><td>{s["label"]}</td><td>{esc(s["txt"])}</td></tr>'
+            for s in nr["sessions"]
+        )
+        countdown = "今天就是比赛日!" if nr["days"] == 0 else f'距正赛还有 <b>{nr["days"]}</b> 天'
         next_html = (
-            f'<div class="nextrace">🏁 下一站:<b>{esc(nr["name"])}</b>'
+            f'<div class="nextrace">🏁 第{nr["round"]}站:<b>{esc(nr["name"])}</b>'
             f'<span class="dim">{esc(nr["circuit"])}</span>'
-            f'<div>正赛 北京时间 {esc(nr["cst"])} · 还有 <b>{nr["days"]}</b> 天</div></div>'
+            f'<div class="small" style="margin:4px 0">{countdown} · 以下均为北京时间</div>'
+            f'<table>{srows}</table></div>'
         )
 
     drows = "".join(
@@ -173,7 +237,7 @@ def render(f1_news, standings, artists, now):
         for c in standings["constructors"]
     )
     nrows = "".join(
-        f'<li><a href="{esc(n["link"])}" target="_blank">{esc(n["title"])}</a>'
+        f'<li><a href="{esc(n["link"])}" target="_blank" rel="noopener">{esc(n["title"])}</a>'
         f'<span class="dim"> · {esc(n["src"])} · {int(n["age"])}h前</span></li>'
         for n in f1_news
     )
@@ -183,12 +247,13 @@ def render(f1_news, standings, artists, now):
     for a in artists:
         bar = int(a["score"] / max_score * 100)
         fire = "🔥" * min(3, 1 + a["score"] // (max_score // 2 + 1)) if a["score"] else "💤"
+        trend = trend_mark(a["score"], prev_scores.get(a["name"]))
         links = "".join(
-            f'<li><a href="{esc(t["link"])}" target="_blank">{esc(t["title"])}</a></li>'
+            f'<li><a href="{esc(t["link"])}" target="_blank" rel="noopener">{esc(t["title"])}</a></li>'
             for t in a["top"]
         )
         acards += f"""<div class="card artist">
-<div class="ahead"><b>{esc(a["name"])}</b><span>{fire} 热度 {a["score"]}</span></div>
+<div class="ahead"><b>{esc(a["name"])}</b><span>{fire} 热度 {a["score"]} {trend}</span></div>
 <div class="bar"><i style="width:{bar}%"></i></div>
 <div class="dim small">24h 内 {a["n24"]} 条报道 · 48h 内 {a["n48"]} 条</div>
 <ul class="small">{links}</ul></div>"""
@@ -201,7 +266,8 @@ def render(f1_news, standings, artists, now):
 :root {{ color-scheme: dark; }}
 * {{ box-sizing: border-box; margin: 0; }}
 body {{ font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-  background: #0d1117; color: #e6edf3; padding: 16px; max-width: 760px; margin: auto; }}
+  background: #0d1117; color: #e6edf3; padding: 16px; max-width: 760px; margin: auto;
+  -webkit-text-size-adjust: 100%; }}
 h1 {{ font-size: 1.3em; margin-bottom: 2px; }}
 h2 {{ font-size: 1.05em; margin: 18px 0 8px; color: #79c0ff; }}
 .dim {{ color: #8b949e; }} .small {{ font-size: .85em; }}
@@ -210,20 +276,23 @@ h2 {{ font-size: 1.05em; margin: 18px 0 8px; color: #79c0ff; }}
 .nextrace {{ background: linear-gradient(90deg,#2d1a1a,#161b22); border: 1px solid #6e2c2c;
   border-radius: 10px; padding: 12px 14px; margin: 10px 0; }}
 .nextrace .dim {{ margin-left: 8px; font-size: .85em; }}
+.nextrace tr.past td {{ color: #6e7681; text-decoration: line-through; }}
 table {{ width: 100%; border-collapse: collapse; font-size: .9em; }}
 td {{ padding: 4px 6px; border-bottom: 1px solid #21262d; }}
+tr:last-child td {{ border-bottom: none; }}
 .pts {{ text-align: right; font-weight: 600; color: #ffa657; }}
-ul {{ padding-left: 18px; }} li {{ margin: 5px 0; }}
+ul {{ padding-left: 18px; }} li {{ margin: 6px 0; line-height: 1.45; }}
 a {{ color: #a5d6ff; text-decoration: none; }} a:active {{ opacity: .7; }}
-.ahead {{ display: flex; justify-content: space-between; align-items: center; }}
-.ahead span {{ font-size: .85em; color: #ffa657; }}
+.ahead {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
+.ahead span {{ font-size: .85em; color: #ffa657; white-space: nowrap; }}
+.up {{ color: #3fb950; }} .down {{ color: #f85149; }} .flat {{ color: #8b949e; }}
 .bar {{ height: 6px; background: #21262d; border-radius: 3px; margin: 8px 0 4px; }}
 .bar i {{ display: block; height: 100%; border-radius: 3px;
   background: linear-gradient(90deg,#f778ba,#ffa657); }}
 footer {{ margin: 20px 0 8px; text-align: center; font-size: .75em; color: #484f58; }}
 </style></head><body>
 <h1>🛸 樾的热点仪表盘</h1>
-<div class="dim small">更新于 {updated}(北京时间)· by Lando</div>
+<div class="dim small">更新于 {updated}(北京时间)· 每天 07:40 / 19:40 自动刷新 · by Lando</div>
 <h2>🏎️ F1</h2>
 {next_html}
 <div class="card"><b class="small">车手积分榜</b><table>{drows}</table></div>
@@ -231,17 +300,19 @@ footer {{ margin: 20px 0 8px; text-align: center; font-size: .75em; color: #484f
 <div class="card"><b class="small">最新消息</b><ul class="small">{nrows}</ul></div>
 <h2>🎵 歌星热度榜</h2>
 {acards}
-<footer>数据源:Autosport / Motorsport / F1.com / jolpica-f1 / Google News</footer>
+<footer>数据源:Autosport / Motorsport / F1.com / jolpica-f1 / Google News<br>
+热度 = 24h报道×2 + 48h报道 · 箭头为与上次刷新的对比</footer>
 </body></html>"""
 
 
 def main():
     now = datetime.now(timezone.utc)
     f1_news = collect_f1(now)
-    standings = collect_standings()
+    standings = collect_standings(now)
     artists = collect_artists(now)
+    prev_scores = update_history(artists, now)
     out = BASE / "index.html"
-    out.write_text(render(f1_news, standings, artists, now), encoding="utf-8")
+    out.write_text(render(f1_news, standings, artists, prev_scores, now), encoding="utf-8")
     print(f"OK -> {out} ({out.stat().st_size} bytes)")
 
 
