@@ -7,6 +7,7 @@
 v3:每卡片 SVG sparkline、信源扩展(站点 RSS + 别名归属)、热度分 v2(基础信号 + 趋势加成)。
 """
 import json
+import os
 import re
 import html
 import time
@@ -25,6 +26,14 @@ WEEKDAY = "一二三四五六日"
 # 单源超时/重试:批量信源保持轻量,单源 ≤10s(方案约束)
 FEED_TIMEOUT = 10
 FEED_RETRIES = 1
+
+# 整体生成硬预算(秒):超时后剩余信源直接跳过,保证总时长 <90s
+TIME_BUDGET = 80
+_START = time.monotonic()
+
+
+def budget_left():
+    return TIME_BUDGET - (time.monotonic() - _START)
 
 F1_FEEDS = [
     ("Autosport", "https://www.autosport.com/rss/f1/news/"),
@@ -81,6 +90,10 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 
 
 def fetch(url, timeout=20, retries=2):
+    left = budget_left()
+    if left < 3:
+        raise TimeoutError("time budget exhausted")
+    timeout = min(timeout, left)
     last = None
     for i in range(retries + 1):
         try:
@@ -89,19 +102,28 @@ def fetch(url, timeout=20, retries=2):
                 return r.read()
         except Exception as e:
             last = e
-            if i < retries:
+            if i < retries and budget_left() > timeout:
                 time.sleep(2 * (i + 1))
+            else:
+                break
     raise last
 
 
 def _parse_ts(pub):
-    try:
-        ts = parsedate_to_datetime(pub)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return ts
-    except (ValueError, TypeError):
+    """兼容 RSS 的 RFC 2822 和 Atom 的 ISO 8601 两种时间格式。"""
+    pub = (pub or "").strip()
+    if not pub:
         return None
+    try:
+        ts = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            ts = parsedate_to_datetime(pub)
+        except (ValueError, TypeError):
+            return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
 
 
 def parse_rss(raw):
@@ -116,8 +138,9 @@ def parse_rss(raw):
         title = (it.findtext("title") or "").strip()
         link = (it.findtext("link") or "").strip()
         ts = _parse_ts(it.findtext("pubDate") or "")
+        desc = (it.findtext("description") or "").strip()
         if title:
-            items.append({"title": title, "link": link, "ts": ts})
+            items.append({"title": title, "link": link, "ts": ts, "desc": desc})
     # Atom(部分源用 <entry>)
     for it in root.iter(ATOM + "entry"):
         title = (it.findtext(ATOM + "title") or "").strip()
@@ -126,10 +149,11 @@ def parse_rss(raw):
             if ln.get("rel", "alternate") in ("alternate", ""):
                 link = ln.get("href", "")
                 break
-        pub = it.findtext(ATOM + "updated") or it.findtext(ATOM + "published") or ""
+        pub = it.findtext(ATOM + "published") or it.findtext(ATOM + "updated") or ""
         ts = _parse_ts(pub)
+        desc = (it.findtext(ATOM + "summary") or "").strip()
         if title:
-            items.append({"title": title, "link": link, "ts": ts})
+            items.append({"title": title, "link": link, "ts": ts, "desc": desc})
     return items
 
 
@@ -163,7 +187,10 @@ def collect_f1(now):
         except Exception as e:
             print(f"[warn] F1 feed {src}: {e}")
     news.sort(key=lambda x: x["age"])
-    return [n for n in news if n["age"] < 72][:8]
+    dated = [n for n in news if n["ts"] is not None and n["age"] < 72]
+    # F1.com 官方源不带时间字段:feed 本身是最新的,留 2 个固定位排在末尾
+    undated = [n for n in news if n["ts"] is None][:2]
+    return dated[:8 - len(undated)] + undated
 
 
 def collect_standings(now):
@@ -212,17 +239,17 @@ def collect_standings(now):
     return out
 
 
-def match_artist(title):
-    """返回该标题命中的歌手名,未命中返回 None。"""
-    for name, pats in ARTIST_PATTERNS.items():
-        if any(p.search(title) for p in pats):
-            return name
-    return None
+def match_artists(text):
+    """返回文本命中的全部歌手名(合作曲/同篇报道可归属多人)。"""
+    return [name for name, pats in ARTIST_PATTERNS.items()
+            if any(p.search(text) for p in pats)]
 
 
 def collect_artists(now):
+    """返回 (rows, ok_feeds)。ok_feeds=成功抓取的信源数,全挂时调用方不应写历史。"""
     # 每位歌手一个 item 池(先 Google News,再全站源归属),按标题去重
     pools = {name: {} for name in ARTISTS}  # name -> {norm_title: item}
+    ok_feeds = 0
 
     def add(name, it, src):
         key = norm_title(it["title"])
@@ -236,19 +263,20 @@ def collect_artists(now):
             for it in parse_rss(fetch(GNEWS.format(q=urllib.request.quote(name)),
                                       timeout=FEED_TIMEOUT, retries=FEED_RETRIES)):
                 add(name, it, "Google News")
+            ok_feeds += 1
         except Exception as e:
             print(f"[warn] artist gnews {name}: {e}")
 
-    # 2) 全站信源:每源抓一次,按名字归属
+    # 2) 全站信源:每源抓一次,按标题+摘要归属(标题里可能只有歌名没有人名)
     for src, url in ARTIST_FEEDS:
         try:
             items = parse_rss(fetch(url, timeout=FEED_TIMEOUT, retries=FEED_RETRIES))
+            ok_feeds += 1
         except Exception as e:
             print(f"[warn] artist feed {src}: {e}")
             continue
         for it in items:
-            name = match_artist(it["title"])
-            if name:
+            for name in match_artists(it["title"] + " " + it.get("desc", "")):
                 add(name, it, src)
 
     rows = []
@@ -262,7 +290,7 @@ def collect_artists(now):
             "name": name, "n24": n24, "n48": n48, "score": base,
             "top": [{"title": i["title"], "link": i["link"], "src": i["src"]} for i in fresh[:3]],
         })
-    return rows
+    return rows, ok_feeds
 
 
 def load_history():
@@ -272,13 +300,21 @@ def load_history():
         return []
 
 
-def update_history(artists, now):
-    """追加本次基础分快照;返回 (上一次 {name: base}, 含本次的完整 history)。"""
+def update_history(artists, now, ok=True):
+    """追加本次基础分快照;返回 (上一次 {name: base}, 含本次的完整 history)。
+
+    ok=False(信源全挂)时不写快照:失败不是观测值,写 0 会污染趋势和曲线。
+    """
     hist = load_history()
     prev = hist[-1]["scores"] if hist else {}
+    if not ok:
+        print("[warn] all artist feeds failed; history snapshot skipped")
+        return prev, hist
     hist.append({"ts": now.isoformat(timespec="minutes"), "scores": {a["name"]: a["score"] for a in artists}})
     hist = hist[-60:]
-    HISTORY.write_text(json.dumps(hist, ensure_ascii=False, indent=1))
+    tmp = HISTORY.with_suffix(".tmp")
+    tmp.write_text(json.dumps(hist, ensure_ascii=False, indent=1))
+    os.replace(tmp, HISTORY)
     return prev, hist
 
 
@@ -328,6 +364,13 @@ def esc(s):
     return html.escape(s, quote=True)
 
 
+def link_html(link, title):
+    """RSS 是外部输入:仅放行 http(s) 链接,其余降级为纯文本。"""
+    if link.startswith(("https://", "http://")):
+        return f'<a href="{esc(link)}" target="_blank" rel="noopener">{esc(title)}</a>'
+    return esc(title)
+
+
 def render(f1_news, standings, artists, prev_scores, hist, now):
     updated = now.astimezone(CST).strftime("%Y-%m-%d %H:%M")
     nr = standings["next_race"]
@@ -355,17 +398,21 @@ def render(f1_news, standings, artists, prev_scores, hist, now):
         for c in standings["constructors"]
     )
     nrows = "".join(
-        f'<li><a href="{esc(n["link"])}" target="_blank" rel="noopener">{esc(n["title"])}</a>'
-        f'<span class="dim"> · {esc(n["src"])} · {int(n["age"])}h前</span></li>'
+        f'<li>{link_html(n["link"], n["title"])}'
+        f'<span class="dim"> · {esc(n["src"])}'
+        + (f' · {int(n["age"])}h前' if n["ts"] is not None else "")
+        + "</span></li>"
         for n in f1_news
     )
 
     # 计算显示分:composite = base + clamp(base - prev_base, ±10),history 只存 base
+    # 箭头展示真实差值(delta),加成才截断(bonus);显示分保底 0
     for a in artists:
         base = a["score"]
         pv = prev_scores.get(a["name"])
-        a["delta"] = None if pv is None else clamp(base - pv, -10, 10)
-        a["display"] = base + (a["delta"] or 0)
+        a["delta"] = None if pv is None else base - pv
+        bonus = 0 if a["delta"] is None else clamp(a["delta"], -10, 10)
+        a["display"] = max(0, base + bonus)
     artists.sort(key=lambda x: -x["display"])
 
     max_score = max((a["display"] for a in artists), default=0) or 1
@@ -378,7 +425,7 @@ def render(f1_news, standings, artists, prev_scores, hist, now):
         spark = sparkline(series)
         spark_html = f'<div class="sparkrow">{spark}</div>' if spark else ""
         links = "".join(
-            f'<li><a href="{esc(t["link"])}" target="_blank" rel="noopener">{esc(t["title"])}</a>'
+            f'<li>{link_html(t["link"], t["title"])}'
             f'<span class="dim"> · {esc(t["src"])}</span></li>'
             for t in a["top"]
         )
@@ -442,8 +489,8 @@ def main():
     now = datetime.now(timezone.utc)
     f1_news = collect_f1(now)
     standings = collect_standings(now)
-    artists = collect_artists(now)
-    prev_scores, hist = update_history(artists, now)
+    artists, ok_feeds = collect_artists(now)
+    prev_scores, hist = update_history(artists, now, ok=ok_feeds > 0)
     out = BASE / "index.html"
     out.write_text(render(f1_news, standings, artists, prev_scores, hist, now), encoding="utf-8")
     print(f"OK -> {out} ({out.stat().st_size} bytes)")
