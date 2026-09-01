@@ -1,16 +1,5 @@
 [
  {
-  "ts": "2026-08-01T11:40+00:00",
-  "scores": {
-   "Olivia Rodrigo": 72,
-   "Ariana Grande": 203,
-   "Charli XCX": 102,
-   "Tate McRae": 10,
-   "Billie Eilish": 49,
-   "RAYE": 27
-  }
- },
- {
   "ts": "2026-08-01T23:40+00:00",
   "scores": {
    "Olivia Rodrigo": 87,
@@ -657,6 +646,17 @@
    "Tate McRae": 26,
    "Billie Eilish": 132,
    "RAYE": 11
+  }
+ },
+ {
+  "ts": "2026-09-01T11:40+00:00",
+  "scores": {
+   "Olivia Rodrigo": 156,
+   "Ariana Grande": 105,
+   "Charli XCX": 20,
+   "Tate McRae": 32,
+   "Billie Eilish": 113,
+   "RAYE": 10
   }
  }
 ]
